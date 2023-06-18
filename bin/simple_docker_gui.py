@@ -29,13 +29,14 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import threading
 import docker
 import json
 import os
-from subprocess import PIPE, Popen
+import subprocess
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk, GObject, Pango
 
 class DialogEntry(Gtk.Dialog):
     def __init__(self, parent, title, label, only_message=False):
@@ -56,6 +57,8 @@ class Handler:
         self.builder = builder
         self.compose_path = None
         self.dialog = None
+        self.command_stdout = None
+        self.command = None
 
     def show_compose_dialog(self, name, image, volumes, ports, environment):
         if self.dialog == None:
@@ -222,15 +225,70 @@ class Handler:
         dialog.run()
         dialog.destroy()
 
+    def exec_command(self, command):
+        if self.command != None:
+            dialog = Gtk.MessageDialog(
+                transient_for=self.builder.get_object("main_window"),
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text=self.command,
+                )
+            dialog.format_secondary_text("Error: Command: {0}\n is running".format(command))
+            dialog.run()
+            dialog.destroy()
+            return
+        terminal_textbuffer = self.builder.get_object("terminal_textbuffer")
+        terminal_textbuffer.set_text("{0}\n".format(command))
+        tag = terminal_textbuffer.create_tag("bold", weight=Pango.Weight.BOLD)
+        terminal_textbuffer.apply_tag(tag, terminal_textbuffer.get_start_iter(), terminal_textbuffer.get_end_iter())
+        self.command_stdout = os.popen(command + " &> /dev/stdout", "r")
+        self.command = command
+        thread = threading.Thread(target=self.exec_command_background)
+        thread.daemon = True
+        thread.start()
+
+    def update_progress(self, line):
+        terminal_textbuffer = self.builder.get_object("terminal_textbuffer")
+        iter_ = terminal_textbuffer.get_end_iter()
+        terminal_textbuffer.insert(iter_, line)
+        iter_ = terminal_textbuffer.get_end_iter()
+        terminal_textview = self.builder.get_object("terminal_textview")
+        terminal_textview.scroll_to_iter(iter_, 0, False, 0, 1.0)
+        return False
+       
+    def show_end_exec_command(self, command):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.builder.get_object("main_window"),
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=self.command,
+            )
+        dialog.format_secondary_text("Command end: {0}".format(self.command))
+        dialog.run()
+        dialog.destroy()
+        self.command_stdout = None
+        self.command = None
+        self.update_list(None)
+        return False
+
+    def exec_command_background(self):
+        for line in self.command_stdout:
+             GLib.idle_add(self.update_progress, line)
+        GLib.idle_add(self.update_progress, "End.")
+        GLib.idle_add(self.update_progress, "\n\n\n")
+        GLib.idle_add(self.show_end_exec_command, None)
+
     def run_command_containers_row(self, command):
         containers_tree_view = self.builder.get_object("containers_tree_view")
         model, treeiter = containers_tree_view.get_selection().get_selected()
         if treeiter is not None:
             container = "{0}".format(model[treeiter][0])
             command = command.format(container)
-            self.run_command(command)
+            self.exec_command(command)
+            #self.run_command(command)
         self.update_list(None)
-
 
     def on_destroy(self, *args):
         print("Destroy")
@@ -243,7 +301,8 @@ class Handler:
             image = "{0}:{1}".format(model[treeiter][0], model[treeiter][1])
             command = "docker run -d '{0}'".format(image)
             print(command)
-            os.system(command)
+            #os.system(command)
+            self.exec_command(command)
 
     def on_delete_image(self, button):
         images_tree_view = self.builder.get_object("images_tree_view")
@@ -254,7 +313,7 @@ class Handler:
             if response == Gtk.ResponseType.OK:
                 image = "{0}:{1}".format(model[treeiter][0], model[treeiter][1])
                 command = "docker rmi '{0}'".format(image)
-                self.run_command(command)
+                self.exec_command(command)
             dialog.destroy()
         self.update_list(None)
 
@@ -265,15 +324,17 @@ class Handler:
             image = "{0}:{1}".format(model[treeiter][0], model[treeiter][1])
             command = "konsole -e docker run -it '{0}' &".format(image)
             print(command)
-            os.system(command)
+            #os.system(command)
+            self.exec_command(command)
 
     def on_pull_image(self, button):
         dialog = DialogEntry(self.builder.get_object("main_window"), "Pull image", "Image name:")
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
-            image = dialog.entry.get_text()
-            command = "konsole -e docker pull '{0}'".format(image)
-            os.system(command)
+            image = dialog.entry.get_text().strip()
+            #command = "konsole -e docker pull '{0}'".format(image)
+            #os.system(command)
+            self.exec_command("docker pull '{0}'".format(image))
         elif response == Gtk.ResponseType.CANCEL:
             print("The Cancel button was clicked")
         dialog.destroy()
@@ -317,9 +378,10 @@ class Handler:
         model, treeiter = containers_tree_view.get_selection().get_selected()
         if treeiter is not None:
             container = "{0}".format(model[treeiter][0])
-            command = "konsole -e docker logs -f '{0}' &".format(container)
+            command = "docker logs -f '{0}'".format(container)
             print(command)
-            os.system(command)
+            #os.system(command)
+            self.exec_command(command)
             self.update_list(None)
 
     def on_add_compose(self, button):
@@ -433,13 +495,15 @@ class Handler:
         self.on_save_compose(button)
         command = 'cd "{0}" ; docker-compose up --remove-orphans -d'.format(self.compose_path)
         print(command)
-        os.system(command)
+        #os.system(command)
+        self.exec_command(command)
         self.update_list(None)
 
     def on_stop_compose(self, button):
         command = 'cd "{0}" ; docker-compose down'.format(self.compose_path)
         print(command)
-        os.system(command)
+        #os.system(command)
+        self.exec_command(command)
         self.update_list(None)
 
     def on_edit_compose(self, button):
@@ -510,6 +574,8 @@ builder.add_from_string("""
       <column type="gchararray"/>
     </columns>
   </object>
+  <object class="GtkTextBuffer" id="ports_textbuffer"/>
+  <object class="GtkTextBuffer" id="terminal_textbuffer"/>
   <object class="GtkWindow" id="main_window">
     <property name="can-focus">False</property>
     <property name="title" translatable="yes">Simple docker GUI (sdg)</property>
@@ -977,13 +1043,33 @@ builder.add_from_string("""
           <packing>
             <property name="expand">True</property>
             <property name="fill">True</property>
+            <property name="position">0</property>
+          </packing>
+        </child>
+        <child>
+          <object class="GtkScrolledWindow">
+            <property name="visible">True</property>
+            <property name="can-focus">True</property>
+            <property name="shadow-type">in</property>
+            <child>
+              <object class="GtkTextView" id="terminal_textview">
+                <property name="visible">True</property>
+                <property name="can-focus">True</property>
+                <property name="editable">False</property>
+                <property name="buffer">terminal_textbuffer</property>
+                <property name="accepts-tab">False</property>
+              </object>
+            </child>
+          </object>
+          <packing>
+            <property name="expand">True</property>
+            <property name="fill">True</property>
             <property name="position">1</property>
           </packing>
         </child>
       </object>
     </child>
   </object>
-  <object class="GtkTextBuffer" id="ports_textbuffer"/>
   <object class="GtkTextBuffer" id="volumes_textbuffer"/>
   <object class="GtkDialog" id="compose_dialog">
     <property name="can-focus">False</property>
